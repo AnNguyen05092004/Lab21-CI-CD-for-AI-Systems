@@ -11,7 +11,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from src.train import train
+from src.train import train, kiem_tra_lech_du_lieu, quet_nguong
 
 # 10 đặc trưng đầu vào, đúng thứ tự mà mô hình và API /score sử dụng
 FEATURE_NAMES = [
@@ -93,6 +93,9 @@ def test_report_file_created(tmp_path, monkeypatch):
         report = json.load(f)
     assert "f1_score" in report
     assert "accuracy" in report
+    assert "positive_rate" in report
+    assert "best_threshold" in report
+    assert "best_f1" in report
 
 
 def test_model_file_created(tmp_path, monkeypatch):
@@ -106,3 +109,22 @@ def test_model_file_created(tmp_path, monkeypatch):
     )
 
     assert os.path.exists("models/model.joblib")
+
+
+def test_canh_bao_lech_du_lieu():
+    """Bonus 5: lệch quá 5 điểm phần trăm thì cảnh báo, trong biên độ thì không."""
+    # 50% so với mức tham chiếu 24.8%: lệch hơn 25 điểm -> phải cảnh báo
+    assert kiem_tra_lech_du_lieu(0.50) is True
+    # 25% gần sát 24.8% -> bình thường
+    assert kiem_tra_lech_du_lieu(0.25) is False
+
+
+def test_quet_nguong_chon_nguong_tot():
+    """Bonus 2: với xác suất tách bạch hai lớp, F1 tốt nhất phải bằng 1.0."""
+    # Hai mẫu âm có xác suất thấp (0.1; 0.2), hai mẫu dương có xác suất cao (0.8; 0.9)
+    y_that = pd.Series([0, 0, 1, 1])
+    xac_suat = np.array([0.1, 0.2, 0.8, 0.9])
+    nguong, f1_tot = quet_nguong(y_that, xac_suat)
+    assert f1_tot == 1.0
+    # Ngưỡng tốt phải nằm giữa hai nhóm xác suất
+    assert 0.2 < nguong <= 0.8
