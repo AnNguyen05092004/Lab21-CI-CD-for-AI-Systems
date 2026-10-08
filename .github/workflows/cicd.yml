@@ -7,6 +7,11 @@
 #   nối tiếp nhau:
 #       Unit Test -> Train -> Quality Gate -> Release
 #   Job sau chỉ chạy nếu job trước THÀNH CÔNG (nhờ khai báo `needs`).
+#
+# Cách cất model trên bucket (Bonus 4):
+#   artifacts/candidate/  : model + report của lần chạy này (ứng viên, chưa chính thức)
+#   artifacts/current/    : model + report ĐANG CHẠY trên VM
+#   Ứng viên chỉ được chuyển sang current/ khi vượt qua Quality Gate.
 # =============================================================================
 name: Income Model CI/CD
 
@@ -49,7 +54,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # JOB 2 - TRAIN
-  # Xác thực với cloud, kéo dữ liệu bằng DVC, huấn luyện, tải model lên bucket.
+  # Xác thực với cloud, kéo dữ liệu bằng DVC, huấn luyện, rồi đưa model + báo cáo
+  # lên kho ỨNG VIÊN (artifacts/candidate/). Chưa đụng tới artifacts/current/.
   # Chỉ chạy khi Job 1 (Unit Test) thành công.
   # ---------------------------------------------------------------------------
   train:
@@ -102,7 +108,7 @@ jobs:
       - name: Tạo báo cáo chi tiết (precision, recall, ma trận nhầm lẫn)
         run: python src/detail_report.py
 
-      - name: Tải model lên Cloud Storage
+      - name: Tải model và báo cáo lên kho ứng viên
         env:
           ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
         run: |
@@ -111,11 +117,15 @@ jobs:
           from google.cloud import storage
 
           # Tự đọc key từ biến GOOGLE_APPLICATION_CREDENTIALS đã đặt ở bước xác thực
-          client = storage.Client()
-          bucket = client.bucket(os.environ["ARTIFACT_BUCKET"])
-          blob = bucket.blob("artifacts/current/model.joblib")
-          blob.upload_from_filename("models/model.joblib")
-          print(f"Đã tải model lên gs://{bucket.name}/{blob.name}")
+          bucket = storage.Client().bucket(os.environ["ARTIFACT_BUCKET"])
+
+          # Mỗi cặp: (file trên runner, đường dẫn đích trên bucket)
+          for nguon, dich in [
+              ("models/model.joblib", "artifacts/candidate/model.joblib"),
+              ("outputs/report.json", "artifacts/candidate/report.json"),
+          ]:
+              bucket.blob(dich).upload_from_filename(nguon)
+              print(f"Đã tải {nguon} lên gs://{bucket.name}/{dich}")
           PYEOF
 
       - name: Lưu báo cáo thành artifact
@@ -127,10 +137,11 @@ jobs:
             outputs/detail.txt
 
 
-
   # ---------------------------------------------------------------------------
   # JOB 3 - QUALITY GATE (cổng chất lượng)
-  # Chỉ cho đi tiếp nếu f1_score >= 0.65.
+  # Hai điều kiện, phải thỏa cả hai mới được đi tiếp:
+  #   1) f1_score >= 0.65 (ngưỡng tuyệt đối).
+  #   2) f1_score mới >= f1_score của model đang chạy (Bonus 4).
   #
   # Lưu ý: ngưỡng đặt trên f1_score chứ KHÔNG phải accuracy. Dữ liệu có tỷ lệ
   # lớp 75/25, nên một mô hình đoán bừa "thu nhập thấp" cho mọi người vẫn đạt
@@ -142,7 +153,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - name: Kiểm tra ngưỡng chất lượng
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cài thư viện Cloud Storage
+        run: pip install google-cloud-storage==2.16.0
+
+      - name: Xác thực với Cloud Storage
+        env:
+          STORAGE_CREDENTIALS: ${{ secrets.STORAGE_CREDENTIALS }}
+        run: |
+          printf '%s' "$STORAGE_CREDENTIALS" > /tmp/sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> "$GITHUB_ENV"
+
+      - name: Điều kiện 1 - kiểm tra ngưỡng chất lượng
         # Output của GitHub Actions luôn là CHUỖI, nên phải ép sang số thực
         # bằng float() trước khi so sánh.
         env:
@@ -161,10 +186,39 @@ jobs:
           print(f"ĐẠT: f1_score {f1:.4f} >= {NGUONG_F1}. Tiếp tục triển khai model.")
           PYEOF
 
+      - name: Điều kiện 2 - so sánh với model đang chạy (Bonus 4)
+        env:
+          F1: ${{ needs.train.outputs.f1 }}
+          ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          import os
+          from google.cloud import storage
+
+          f1_moi = float(os.environ["F1"])
+          bucket = storage.Client().bucket(os.environ["ARTIFACT_BUCKET"])
+          blob_cu = bucket.blob("artifacts/current/report.json")
+
+          # Lần triển khai đầu tiên: chưa có báo cáo cũ để so sánh
+          if not blob_cu.exists():
+              print("Chưa có báo cáo của lần chạy trước (lần triển khai đầu tiên). Cho phép triển khai.")
+          else:
+              f1_cu = float(json.loads(blob_cu.download_as_text())["f1_score"])
+              print(f"So sánh: F1 mới = {f1_moi:.4f} | F1 model đang chạy = {f1_cu:.4f}")
+              if f1_moi < f1_cu:
+                  raise SystemExit(
+                      f"THẤT BẠI: F1 mới {f1_moi:.4f} thấp hơn model đang chạy {f1_cu:.4f}. "
+                      "Hủy triển khai, giữ nguyên model cũ."
+                  )
+              print("ĐẠT: F1 mới cao hơn hoặc bằng model đang chạy. Cho phép triển khai.")
+          PYEOF
+
 
   # ---------------------------------------------------------------------------
   # JOB 4 - RELEASE
-  # SSH vào VM, khởi động lại dịch vụ để nạp model mới, rồi kiểm tra sức khỏe.
+  # 1) Chuyển model ứng viên sang vị trí chính thức (artifacts/current/).
+  # 2) SSH vào VM, khởi động lại dịch vụ để nạp model mới, rồi kiểm tra sức khỏe.
   # Chỉ chạy khi Job 3 (Quality Gate) thành công.
   # ---------------------------------------------------------------------------
   release:
@@ -172,6 +226,37 @@ jobs:
     needs: quality-gate
     runs-on: ubuntu-latest
     steps:
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cài thư viện Cloud Storage
+        run: pip install google-cloud-storage==2.16.0
+
+      - name: Xác thực với Cloud Storage
+        env:
+          STORAGE_CREDENTIALS: ${{ secrets.STORAGE_CREDENTIALS }}
+        run: |
+          printf '%s' "$STORAGE_CREDENTIALS" > /tmp/sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> "$GITHUB_ENV"
+
+      - name: Chuyển model ứng viên sang vị trí chính thức
+        env:
+          ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          from google.cloud import storage
+
+          bucket = storage.Client().bucket(os.environ["ARTIFACT_BUCKET"])
+
+          # Sao chép (không xóa nguồn) cả model lẫn báo cáo sang artifacts/current/
+          for ten in ["model.joblib", "report.json"]:
+              nguon = bucket.blob(f"artifacts/candidate/{ten}")
+              bucket.copy_blob(nguon, bucket, f"artifacts/current/{ten}")
+              print(f"Đã chuyển artifacts/candidate/{ten} -> artifacts/current/{ten}")
+          PYEOF
 
       - name: Triển khai lên VM qua SSH
         uses: appleboy/ssh-action@v1.0.3
