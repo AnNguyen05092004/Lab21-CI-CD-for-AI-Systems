@@ -1,0 +1,5 @@
+[core]
+    remote = labstore
+['remote "labstore"']
+    url = gs://lab21-cicd-an-v2-redo-0810/dvc
+    credentialpath = ../sa-key.json

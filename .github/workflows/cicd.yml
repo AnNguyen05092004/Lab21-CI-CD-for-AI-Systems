@@ -1,4 +1,18 @@
+# =============================================================================
+# .github/workflows/cicd.yml - Pipeline CI/CD cho mô hình dự đoán thu nhập
+#
+# Vai trò của file trong hệ thống:
+#   Mỗi lần bạn `git push` lên nhánh main và có thay đổi ở dữ liệu (file .dvc),
+#   mã nguồn (src/*.py) hoặc siêu tham số (params.yaml), GitHub tự chạy 4 job
+#   nối tiếp nhau:
+#       Unit Test -> Train -> Quality Gate -> Release
+#   Job sau chỉ chạy nếu job trước THÀNH CÔNG (nhờ khai báo `needs`).
+# =============================================================================
 name: Income Model CI/CD
+
+# Tên hiển thị của mỗi lần chạy = nội dung commit message, để dễ phân biệt
+# lần chạy của Bước 2 (commit code) với lần chạy của Bước 3 (commit dữ liệu).
+run-name: ${{ github.event.head_commit.message || 'Chạy thủ công' }}
 
 on:
   push:
@@ -13,9 +27,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # JOB 1 - UNIT TEST
-  # Chay unit tests tren du lieu ao (khong can ket noi cloud storage).
-  # Neu co bat ky test nao that bai, pipeline dung lai o day va khong tien hanh
-  # huan luyen hay trien khai.
+  # Chạy các bài kiểm tra trên dữ liệu giả (không cần kết nối cloud storage).
+  # Nếu có test thất bại, pipeline dừng ngay tại đây.
   # ---------------------------------------------------------------------------
   unit-test:
     name: Unit Test
@@ -27,23 +40,23 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Cài đặt thư viện
         run: pip install -r requirements.txt
 
-      - name: Run unit tests
-        # TODO 1: Viet lenh de chay pytest tren thu muc tests/ voi co -v
-        run: # <dien lenh o day>
+      - name: Chạy unit test
+        run: python -m pytest tests/ -v
 
 
   # ---------------------------------------------------------------------------
   # JOB 2 - TRAIN
-  # Xac thuc cloud storage, pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
-  # Chi chay khi Job 1 (Unit Test) hoan thanh thanh cong.
+  # Xác thực với cloud, kéo dữ liệu bằng DVC, huấn luyện, tải model lên bucket.
+  # Chỉ chạy khi Job 1 (Unit Test) thành công.
   # ---------------------------------------------------------------------------
   train:
     name: Train
     needs: unit-test
     runs-on: ubuntu-latest
+    # Khai báo "đầu ra" của job để job quality-gate đọc được giá trị f1
     outputs:
       f1: ${{ steps.read_report.outputs.f1 }}
 
@@ -54,48 +67,55 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Cài đặt thư viện
         run: pip install -r requirements.txt
 
-      - name: Authenticate to Cloud Storage
-        # TODO 2: Ghi noi dung credentials ra file tam va set bien moi truong xac thuc.
-        # GCP:   echo '${{ secrets.STORAGE_CREDENTIALS }}' > /tmp/sa-key.json
-        #        echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
-        # AWS:   echo "AWS_ACCESS_KEY_ID=..." >> $GITHUB_ENV  (lay tu secrets)
-        #        echo "AWS_SECRET_ACCESS_KEY=..." >> $GITHUB_ENV
-        # Azure: echo "AZURE_STORAGE_CONNECTION_STRING=..." >> $GITHUB_ENV
+      - name: Xác thực với Cloud Storage
+        # Secret được truyền qua biến môi trường rồi ghi ra file tạm.
+        # Dùng printf '%s' để ghi nguyên văn, không để shell biến đổi ký tự.
+        env:
+          STORAGE_CREDENTIALS: ${{ secrets.STORAGE_CREDENTIALS }}
         run: |
-          # <dien code o day>
+          printf '%s' "$STORAGE_CREDENTIALS" > /tmp/sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> "$GITHUB_ENV"
 
-      - name: Pull data with DVC
-        # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
-        #         Chi pull train_batch1.csv va holdout.csv (khong can train_batch2.csv).
-        run: # <dien lenh o day>
+      - name: Kéo dữ liệu bằng DVC
+        # File .dvc trong git trỏ credentialpath tới sa-key.json trên máy bạn
+        # (không tồn tại trên runner). Lệnh --local ghi đè đường dẫn đó chỉ cho
+        # runner này, rồi chỉ kéo 2 file cần thiết (không cần train_batch2).
+        run: |
+          dvc remote modify --local labstore credentialpath /tmp/sa-key.json
+          dvc pull data/train_batch1.csv.dvc data/holdout.csv.dvc
 
-      - name: Train model
+      - name: Huấn luyện mô hình
         run: python src/train.py
 
-      - name: Read report
+      - name: Đọc báo cáo
         id: read_report
-        # TODO 4: Doc gia tri "f1_score" tu outputs/report.json bang Python inline.
-        #         Set ket qua thanh output "f1" de job quality-gate co the doc.
-        #
-        # Goi y:
-        #   F1=$(python -c "import json; d=json.load(open('outputs/report.json')); print(d['f1_score'])")
-        #   echo "f1=$F1" >> $GITHUB_OUTPUT
+        # Lấy f1_score từ outputs/report.json rồi ghi vào GITHUB_OUTPUT
+        # để job quality-gate đọc được qua needs.train.outputs.f1
         run: |
-          # <dien code o day>
+          F1=$(python -c "import json; d=json.load(open('outputs/report.json')); print(d['f1_score'])")
+          echo "f1=$F1" >> "$GITHUB_OUTPUT"
+          echo "F1 của lần huấn luyện này: $F1"
 
-      - name: Upload model to Cloud Storage
-        # TODO 5: Su dung cloud SDK de upload models/model.joblib len
-        #         <bucket>/artifacts/current/model.joblib.
-        #         Ten bucket lay tu secret ARTIFACT_BUCKET.
+      - name: Tải model lên Cloud Storage
+        env:
+          ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
         run: |
           python - <<'PYEOF'
-          # <dien code Python o day>
+          import os
+          from google.cloud import storage
+
+          # Tự đọc key từ biến GOOGLE_APPLICATION_CREDENTIALS đã đặt ở bước xác thực
+          client = storage.Client()
+          bucket = client.bucket(os.environ["ARTIFACT_BUCKET"])
+          blob = bucket.blob("artifacts/current/model.joblib")
+          blob.upload_from_filename("models/model.joblib")
+          print(f"Đã tải model lên gs://{bucket.name}/{blob.name}")
           PYEOF
 
-      - name: Save report as artifact
+      - name: Lưu báo cáo thành artifact
         uses: actions/upload-artifact@v4
         with:
           name: report
@@ -103,14 +123,12 @@ jobs:
 
 
   # ---------------------------------------------------------------------------
-  # JOB 3 - QUALITY GATE
-  # Kiem tra nguong chat luong (f1_score >= 0.65).
-  # Pipeline dung lai o day neu mo hinh chua dat yeu cau.
+  # JOB 3 - QUALITY GATE (cổng chất lượng)
+  # Chỉ cho đi tiếp nếu f1_score >= 0.65.
   #
-  # Luu y: nguong o day dat tren f1_score chu KHONG phai accuracy. Bo du lieu
-  # Adult co ty le lop 75/25, nen mot mo hinh doan bua "thu nhap thap" cho moi
-  # mau da dat accuracy 0.75 ma hoan toan vo dung.
-  # Chi chay khi Job 2 (Train) hoan thanh thanh cong.
+  # Lưu ý: ngưỡng đặt trên f1_score chứ KHÔNG phải accuracy. Dữ liệu có tỷ lệ
+  # lớp 75/25, nên một mô hình đoán bừa "thu nhập thấp" cho mọi người vẫn đạt
+  # accuracy 0.75 mà hoàn toàn vô dụng.
   # ---------------------------------------------------------------------------
   quality-gate:
     name: Quality Gate
@@ -118,26 +136,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - name: Check quality gate
-        # TODO 6: Doc f1 tu output cua job train.
-        #         Neu f1 < 0.65, ket thuc voi loi ro rang.
-        #         Neu dat nguong, in thong bao va tiep tuc.
-        #
-        # Goi y:
-        #   f1 = float("${{ needs.train.outputs.f1 }}")
-        #   if f1 < 0.65:
-        #       raise SystemExit(f"FAILED: f1_score {f1:.4f} < 0.65. Huy trien khai.")
-        #   print("PASSED: dang trien khai model.")
+      - name: Kiểm tra ngưỡng chất lượng
+        # Output của GitHub Actions luôn là CHUỖI, nên phải ép sang số thực
+        # bằng float() trước khi so sánh.
+        env:
+          F1: ${{ needs.train.outputs.f1 }}
         run: |
-          python - <<'PYEOF'
-          # <dien code Python o day>
+          python3 - <<'PYEOF'
+          import os
+
+          NGUONG_F1 = 0.65
+          f1 = float(os.environ["F1"])
+
+          # SystemExit với một chuỗi sẽ in chuỗi đó rồi thoát với mã lỗi 1,
+          # khiến job (và cả pipeline phía sau) chuyển sang màu đỏ.
+          if f1 < NGUONG_F1:
+              raise SystemExit(f"THẤT BẠI: f1_score {f1:.4f} < {NGUONG_F1}. Hủy triển khai.")
+          print(f"ĐẠT: f1_score {f1:.4f} >= {NGUONG_F1}. Tiếp tục triển khai model.")
           PYEOF
 
 
   # ---------------------------------------------------------------------------
   # JOB 4 - RELEASE
-  # Trien khai len VM qua SSH.
-  # Chi chay khi Job 3 (Quality Gate) hoan thanh thanh cong.
+  # SSH vào VM, khởi động lại dịch vụ để nạp model mới, rồi kiểm tra sức khỏe.
+  # Chỉ chạy khi Job 3 (Quality Gate) thành công.
   # ---------------------------------------------------------------------------
   release:
     name: Release
@@ -145,19 +167,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - name: SSH deploy to VM
+      - name: Triển khai lên VM qua SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
-            # TODO 7: Restart service income-api tren VM.
-            # TODO 8: Cho server san sang roi goi curl /healthz de xac nhan.
-            #         Neu health check that bai sau nhieu lan thu, thoat voi exit 1.
-            #
-            # Goi y:
-            #   sudo systemctl restart income-api
-            #   sleep 5
-            #   curl -sf http://localhost:8080/healthz && echo "Health check passed." || exit 1
-            # <dien lenh bash o day>
+            # Khởi động lại dịch vụ: khi khởi động, serve.py sẽ tải model mới nhất
+            sudo systemctl restart income-api
+            sleep 5
+
+            # Hỏi /healthz tối đa 6 lần, mỗi lần cách nhau 5 giây
+            for lan in 1 2 3 4 5 6; do
+              if curl -sf http://localhost:8080/healthz; then
+                echo "Health check thành công ở lần thử thứ $lan."
+                exit 0
+              fi
+              echo "Lần thử $lan thất bại, chờ 5 giây rồi thử lại..."
+              sleep 5
+            done
+
+            echo "Health check thất bại sau 6 lần thử."
+            exit 1
